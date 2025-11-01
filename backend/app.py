@@ -142,5 +142,9 @@ def upload():
     os.remove(temp_path)
     return jsonify(dados)
 
+@app.route("/")
+def home():
+    return "Backend online!"
+
 if __name__ == '__main__':
      app.run(host="0.0.0.0", port=5000)
