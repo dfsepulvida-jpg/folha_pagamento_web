@@ -35,7 +35,7 @@ function App() {
   const handleUpload = async () => {
     const formData = new FormData();
     formData.append('file', file);
-    const res = await axios.post('http://localhost:5000/upload', formData);
+    const res = await axios.post('https://folhapagamentoweb-production.up.railway.app/upload', formData);
     setDados(res.data);
   };
 
