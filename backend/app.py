@@ -26,21 +26,41 @@ def limpar_nome(bloco):
 
 def limpar_cargo(bloco):
     """
-    Extrai o cargo e garante que a parte 'C.B.O' (ou sufixos) não faça parte do cargo.
-    - Primeiro tenta extrair cargos apenas em maiúsculas (padrão anterior).
-    - Se encontrado, remove qualquer ocorrência 'C.B.O' e tudo que venha depois (caso tenha sido capturado).
-    - Fallback: pega até 'C.B.O:' quando esse marcador aparece no texto bruto.
+    Extrai o cargo e remove qualquer ocorrência/ruído relativo a C.B.O.
+    Geralmente o marcador 'C.B.O' pertence a outro campo; garantimos que:
+    - qualquer variante de 'C.B.O' (com/sem pontos, com ou sem dois-pontos) seja removida,
+    - e tudo que vier imediatamente após (números/ponctuação) também seja descartado.
+    Mantemos o restante do cargo e normalizamos espaços.
     """
-    cargo_match = re.search(r'Cargo:\s*\d*\s*([A-ZÇÁÉÍÓÚÃÕÂÊÔ\s\.\-]+)', bloco)
-    if cargo_match:
-        cargo_raw = cargo_match.group(1).strip()
-        # Remove eventual 'C.B.O' e tudo que venha depois (caso tenha sido capturado)
-        cargo_clean = re.sub(r'\s*C\.B\.O\.?:.*$', '', cargo_raw, flags=re.IGNORECASE).strip()
-        return ' '.join(cargo_clean.split())
-    cargo_match2 = re.search(r'Cargo:\s*(.*?)C\.B\.O\:', bloco, re.DOTALL | re.IGNORECASE)
-    if cargo_match2:
-        return ' '.join(cargo_match2.group(1).strip().split())
-    return ""
+    if not bloco:
+        return ""
+    # Captura o conteúdo depois de 'Cargo:' até a quebra de linha ou fim do bloco
+    m = re.search(r'Cargo:\s*(.+?)(?:\n|$)', bloco, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    cargo_raw = m.group(1).strip()
+
+    # Remove padrões de C.B.O em diversas formas:
+    # Ex.: "C.B.O", "C.B.O.", "C B O", "C B O:", "C.B.O: 123", etc.
+    # Também remove eventuais sufixos numéricos ou pontuação imediatamente após.
+    cargo_clean = re.sub(r'\bC\.?\s*B\.?\s*O\.?\b[:\s\.\-0-9]*', '', cargo_raw, flags=re.IGNORECASE)
+
+    # Em alguns PDFs o marcador vem separado por ponto ou sem espaços - aplicar remoção extra
+    cargo_clean = re.sub(r'\bCBO\b[:\s\.\-0-9]*', '', cargo_clean, flags=re.IGNORECASE)
+
+    # Remover restos como ' :', trailing hyphens, ou múltiplos espaços
+    cargo_clean = re.sub(r'[:\-\s]+$', '', cargo_clean)
+    cargo_clean = re.sub(r'\s+', ' ', cargo_clean).strip()
+
+    # Se o cargo for numérico ou vazio após limpeza, tentar fallback que pega até 'C.B.O' explícito
+    if cargo_clean == "":
+        fb = re.search(r'Cargo:\s*(.*?)C\.?\.?B\.?\.?O\.?', bloco, re.IGNORECASE | re.DOTALL)
+        if fb:
+            cargo_clean = fb.group(1).strip()
+            cargo_clean = re.sub(r'\s+', ' ', cargo_clean)
+
+    # Manter em maiúsculas (compatível com saída anterior)
+    return cargo_clean.upper() if cargo_clean else ""
 
 
 def limpar_empresa(texto):
@@ -121,6 +141,8 @@ def extrair_campo_quantidade_flex(bloco, codigo, texto):
 
 def formato_brasileiro(valor):
     try:
+        if valor is None or valor == "":
+            return ""
         valor_float = float(valor)
         return f"{valor_float:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
     except:
