@@ -161,20 +161,21 @@ def _normalize_money_str(s: str) -> Optional[str]:
 def _extract_value_by_code_strict(bloco: str, code: str, salary_str: Optional[str] = None) -> str:
     """
     Strict extractor that:
-    - finds lines (or windows) that contain the 3-digit code (word boundary),
-    - from that line picks the monetary value (skip the quantity) — choosing the last money token
-      on the same line (or the first money token AFTER the quantity),
-    - ignores matches that are located after a 'Resumo por Rubricas' / 'Líquido Geral' header,
-    - avoids returning the salary value.
-    This follows your requested pattern: rely on the three-digit code and pick the value.
+    1) Looks for a line (or immediate window) containing the 3-digit code.
+    2) On that line, prefers the pattern: code ... QUANTITY ... VALUE
+       where QUANTITY is a numeric token and VALUE is a monetary token (e.g. 417,40).
+       It returns the VALUE that comes immediately after QUANTITY.
+    3) If no quantity+value pattern found, falls back to picking the last money token on that line
+       (but only for lines before any summary header).
+    4) Avoids money tokens that are equal to salary.
     """
     if not bloco:
         return ""
 
-    # normalize spacing issues (e.g., "150HORAS" -> "150 HORAS")
+    # Normalize concatenated tokens like "150HORAS" -> "150 HORAS"
     bloco_norm = re.sub(r'(?P<code>\b\d{2,4})(?=[A-ZÁÉÍÓÚÃÕÂÊÔÇ])', r'\g<code> ', bloco)
 
-    # detect summary header to avoid reading aggregated section below
+    # detect summary header and limit search before it
     summary_header_regex = re.compile(r'(?mi)^\s*(Resumo por Rubricas|Resumo por Rubricas do Centro|Resumo por Rubricas do Centro de Custo|L[ií]quido Geral)\b')
     summary_match = summary_header_regex.search(bloco_norm)
     summary_pos = summary_match.start() if summary_match else None
@@ -190,27 +191,68 @@ def _extract_value_by_code_strict(bloco: str, code: str, salary_str: Optional[st
                 break
 
     money_regex = r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})'
+    qty_regex = r'[\d]+(?:[.,]\d+)?'
 
-    # Search for lines containing the code (prefer earlier lines before summary)
+    # scan lines before summary for the code
     for idx, line in enumerate(lines[:line_limit]):
         if re.search(rf'\b{re.escape(code)}\b', line):
-            # find all money tokens in the same line
+            # 1) try to find pattern: code ... QUANTITY ... VALUE (value after quantity)
+            # Use a regex that captures qty then a monetary value that occurs after it
+            pattern_qty_val = re.compile(
+                rf'\b{re.escape(code)}\b[^\d\n\r]{{0,60}}(?:[A-Z0-9\%\.\,\-\s]{{0,80}})?({qty_regex})\D+({money_regex})',
+                flags=re.IGNORECASE
+            )
+            m_qv = pattern_qty_val.search(line)
+            if m_qv:
+                qty = m_qv.group(1)
+                val = m_qv.group(2)
+                normalized = _normalize_money_str(val)
+                if normalized:
+                    if salary_str:
+                        try:
+                            if float(normalized) == float(salary_str):
+                                # skip if equals salary
+                                pass
+                            else:
+                                return normalized
+                        except Exception:
+                            return normalized
+                    else:
+                        return normalized
+
+            # 2) if not found on same line, try window (line + next 1-2 lines) for qty+value
+            window = ' '.join(lines[idx: idx + 3])
+            m_qv_win = pattern_qty_val.search(window)
+            if m_qv_win:
+                val = m_qv_win.group(2)
+                normalized = _normalize_money_str(val)
+                if normalized:
+                    if salary_str:
+                        try:
+                            if float(normalized) == float(salary_str):
+                                pass
+                            else:
+                                return normalized
+                        except Exception:
+                            return normalized
+                    else:
+                        return normalized
+
+            # 3) fallback: pick last monetary token on the same line (most likely the rubrica value)
             money_matches = re.findall(money_regex, line)
             if money_matches:
-                # If there are >=2 tokens, typically first is quantity and last is value -> pick last
                 chosen = money_matches[-1]
                 normalized = _normalize_money_str(chosen)
                 if normalized:
                     if salary_str:
                         try:
                             if float(normalized) == float(salary_str):
-                                # skip if equals salary
                                 continue
                         except Exception:
                             pass
                     return normalized
-            # If no money in same line, check the next 1-2 lines (some OCR splits)
-            window = ' '.join(lines[idx: idx + 3])
+
+            # 4) fallback: pick last monetary in window
             money_matches = re.findall(money_regex, window)
             if money_matches:
                 chosen = money_matches[-1]
@@ -224,16 +266,13 @@ def _extract_value_by_code_strict(bloco: str, code: str, salary_str: Optional[st
                             pass
                     return normalized
 
-    # As a last resort, search the whole block but only for lines before summary: pick the last money after any code occurrence
-    # (this is conservative: code must appear somewhere earlier than the chosen money)
+    # final fallback: search whole block before summary for a money after a code occurrence
     code_iter = [m.start() for m in re.finditer(rf'\b{re.escape(code)}\b', bloco_norm)]
     if code_iter:
-        # find last money occurrence before summary that comes after a code occurrence
         money_iter = list(re.finditer(money_regex, bloco_norm))
         for mm in reversed(money_iter):
             if summary_pos is not None and mm.start() >= summary_pos:
                 continue
-            # check if there's a code occurrence before this money
             if any(code_pos < mm.start() for code_pos in code_iter):
                 normalized = _normalize_money_str(mm.group(0))
                 if normalized:
@@ -284,13 +323,14 @@ def extrair_funcionarios(pdf_path):
                         dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
 
                         # Use strict code-based extraction for the rubricas you listed
-                        he_50_val = _extract_value_by_code_strict(bloco, '218', salary_str=salario)
-                        he_100_val = _extract_value_by_code_strict(bloco, '358', salary_str=salario)
-                        he50_normais_val = _extract_value_by_code_strict(bloco, '150', salary_str=salario)
-                        he100_normais_val = _extract_value_by_code_strict(bloco, '200', salary_str=salario)
-                        adic_not_val = _extract_value_by_code_strict(bloco, '327', salary_str=salario)
+                        # Map codes exactly to the fields you asked to prioritize
                         reflexo_extras_dsr_val = _extract_value_by_code_strict(bloco, '250', salary_str=salario)
                         reflexo_adic_not_dsr_val = _extract_value_by_code_strict(bloco, '854', salary_str=salario)
+                        he50_normais_val = _extract_value_by_code_strict(bloco, '150', salary_str=salario)
+                        he100_normais_val = _extract_value_by_code_strict(bloco, '200', salary_str=salario)
+                        he_not_50_val = _extract_value_by_code_strict(bloco, '218', salary_str=salario)
+                        he_not_100_val = _extract_value_by_code_strict(bloco, '358', salary_str=salario)
+                        adic_not_val = _extract_value_by_code_strict(bloco, '327', salary_str=salario)
 
                         dados.append({
                             'Competência': competencia,
@@ -310,8 +350,8 @@ def extrair_funcionarios(pdf_path):
                             'Admissão': admissao,
                             'Salário': formato_brasileiro(salario),
                             'Adicional Noturno 20%': formato_brasileiro(adic_not_val),
-                            'HE Noturna 50% + Adic 20%': formato_brasileiro(he_50_val),
-                            'HE Noturna 100% + Adic 20%': formato_brasileiro(he_100_val),
+                            'HE Noturna 50% + Adic 20%': formato_brasileiro(he_not_50_val),
+                            'HE Noturna 100% + Adic 20%': formato_brasileiro(he_not_100_val),
                             'Horas Extras 50%': formato_brasileiro(he50_normais_val),
                             'Horas Extras 100%': formato_brasileiro(he100_normais_val),
                             'Reflexo Adic Noturno DSR': formato_brasileiro(reflexo_adic_not_dsr_val),
