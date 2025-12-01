@@ -158,65 +158,30 @@ def _normalize_money_str(s: str) -> Optional[str]:
         return None
 
 
-def _extract_value_from_line_block_improved(bloco: str, code: str, desc_pattern: str, salary_str: Optional[str] = None, require_both: bool = False) -> str:
+def _extract_value_by_code_strict(bloco: str, code: str, salary_str: Optional[str] = None) -> str:
     """
-    Improved extractor with:
-    - guard against summary section (don't read below 'Resumo...' / 'Líquido Geral'),
-    - prefer same-line code+qty+val matches before summary,
-    - when scanning windows, select monetary value that appears AFTER the code or AFTER the description match (prefer the nearest following money),
-      instead of picking an arbitrary value from the whole window.
-    - require_both: when True, only accept matches where both code and description appear in the same window/line (used for Noturna).
+    Strict extractor that:
+    - finds lines (or windows) that contain the 3-digit code (word boundary),
+    - from that line picks the monetary value (skip the quantity) — choosing the last money token
+      on the same line (or the first money token AFTER the quantity),
+    - ignores matches that are located after a 'Resumo por Rubricas' / 'Líquido Geral' header,
+    - avoids returning the salary value.
+    This follows your requested pattern: rely on the three-digit code and pick the value.
     """
     if not bloco:
         return ""
 
-    # Insert missing spaces like "150HORAS" -> "150 HORAS" (helps regex)
+    # normalize spacing issues (e.g., "150HORAS" -> "150 HORAS")
     bloco_norm = re.sub(r'(?P<code>\b\d{2,4})(?=[A-ZÁÉÍÓÚÃÕÂÊÔÇ])', r'\g<code> ', bloco)
 
-    # Find summary header position (if any) to avoid reading aggregated tables below it
+    # detect summary header to avoid reading aggregated section below
     summary_header_regex = re.compile(r'(?mi)^\s*(Resumo por Rubricas|Resumo por Rubricas do Centro|Resumo por Rubricas do Centro de Custo|L[ií]quido Geral)\b')
     summary_match = summary_header_regex.search(bloco_norm)
     summary_pos = summary_match.start() if summary_match else None
 
-    # 1) same-line pattern: code ... qty ... value
-    same_line_regex = re.compile(
-        rf'\b{re.escape(code)}\b[^\d\n\r]*?([\d]{{1,3}}(?:[.,]\d{{3}})*(?:[.,]\d{{2}})?)\D+([\d]{{1,3}}(?:[.,]\d{{3}})*(?:[.,]\d{{2}})?)',
-        flags=re.IGNORECASE
-    )
-    same_matches = list(same_line_regex.finditer(bloco_norm))
-    if same_matches:
-        chosen = None
-        if summary_pos is not None:
-            for m in same_matches:
-                if m.start() < summary_pos:
-                    chosen = m
-                    break
-        if chosen is None:
-            chosen = same_matches[0]
-        if chosen:
-            span_text = bloco_norm[max(0, chosen.start()-30): chosen.end()+30]
-            if require_both and not re.search(desc_pattern, span_text, flags=re.IGNORECASE):
-                # don't accept this same-line match if description not present nearby
-                pass
-            else:
-                val = chosen.group(2)
-                normalized = _normalize_money_str(val)
-                if normalized and salary_str:
-                    try:
-                        if float(normalized) == float(salary_str):
-                            pass
-                        else:
-                            return normalized
-                    except Exception:
-                        return normalized
-                elif normalized:
-                    return normalized
-
-    # 2) windowed search (line-level), but only up to the summary section
     lines = re.split(r'\r?\n', bloco_norm)
     line_limit = len(lines)
     if summary_pos is not None:
-        # find the line index where summary starts (approx by cumulative length)
         cum = 0
         for i, ln in enumerate(lines):
             cum += len(ln) + 1
@@ -226,77 +191,59 @@ def _extract_value_from_line_block_improved(bloco: str, code: str, desc_pattern:
 
     money_regex = r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})'
 
+    # Search for lines containing the code (prefer earlier lines before summary)
     for idx, line in enumerate(lines[:line_limit]):
-        # Determine whether to consider this line/window:
-        has_code_line = bool(re.search(rf'\b{re.escape(code)}\b', line))
-        has_desc_line = bool(re.search(desc_pattern, line, flags=re.IGNORECASE))
-        # Also check in window (line + next 2 lines)
-        window = ' '.join(lines[idx: idx + 3])
-        has_code_window = bool(re.search(rf'\b{re.escape(code)}\b', window))
-        has_desc_window = bool(re.search(desc_pattern, window, flags=re.IGNORECASE))
-
-        if require_both:
-            if not (has_code_window and has_desc_window):
-                continue
-        else:
-            if not (has_code_line or has_desc_line or has_code_window or has_desc_window):
-                continue
-
-        # Find money occurrences and pick the one that comes AFTER the code (preferred)
-        code_pos = None
-        mcode = re.search(rf'\b{re.escape(code)}\b', window)
-        if mcode:
-            code_pos = mcode.start()
-
-        # If description pattern present, prefer money after description if code not found
-        desc_pos = None
-        mdesc = re.search(desc_pattern, window, flags=re.IGNORECASE)
-        if mdesc:
-            desc_pos = mdesc.end()
-
-        # Find money matches with positions
-        money_iter = list(re.finditer(money_regex, window))
-        chosen_candidate = None
-        if money_iter:
-            # Prefer first money after code_pos
-            if code_pos is not None:
-                for mm in money_iter:
-                    if mm.start() > code_pos:
-                        chosen_candidate = mm.group(0)
-                        break
-            # Else prefer first money after desc_pos
-            if chosen_candidate is None and desc_pos is not None:
-                for mm in money_iter:
-                    if mm.start() > desc_pos:
-                        chosen_candidate = mm.group(0)
-                        break
-            # Else fallback: choose last money in window (most likely the rubrica value)
-            if chosen_candidate is None:
-                chosen_candidate = money_iter[-1].group(0)
-
-            # Normalize and ensure not salary
-            normalized = _normalize_money_str(chosen_candidate)
-            if normalized:
-                if salary_str:
-                    try:
-                        if float(normalized) == float(salary_str):
-                            continue
-                        else:
-                            return normalized
-                    except Exception:
-                        return normalized
-                else:
+        if re.search(rf'\b{re.escape(code)}\b', line):
+            # find all money tokens in the same line
+            money_matches = re.findall(money_regex, line)
+            if money_matches:
+                # If there are >=2 tokens, typically first is quantity and last is value -> pick last
+                chosen = money_matches[-1]
+                normalized = _normalize_money_str(chosen)
+                if normalized:
+                    if salary_str:
+                        try:
+                            if float(normalized) == float(salary_str):
+                                # skip if equals salary
+                                continue
+                        except Exception:
+                            pass
                     return normalized
-
-    # 3) final fallback: description-only search before summary
-    for idx, line in enumerate(lines[:line_limit]):
-        if re.search(desc_pattern, line, flags=re.IGNORECASE):
-            window_text = ' '.join(lines[idx: idx + 3])
-            money_matches = re.findall(money_regex, window_text)
+            # If no money in same line, check the next 1-2 lines (some OCR splits)
+            window = ' '.join(lines[idx: idx + 3])
+            money_matches = re.findall(money_regex, window)
             if money_matches:
                 chosen = money_matches[-1]
                 normalized = _normalize_money_str(chosen)
-                return normalized or ""
+                if normalized:
+                    if salary_str:
+                        try:
+                            if float(normalized) == float(salary_str):
+                                continue
+                        except Exception:
+                            pass
+                    return normalized
+
+    # As a last resort, search the whole block but only for lines before summary: pick the last money after any code occurrence
+    # (this is conservative: code must appear somewhere earlier than the chosen money)
+    code_iter = [m.start() for m in re.finditer(rf'\b{re.escape(code)}\b', bloco_norm)]
+    if code_iter:
+        # find last money occurrence before summary that comes after a code occurrence
+        money_iter = list(re.finditer(money_regex, bloco_norm))
+        for mm in reversed(money_iter):
+            if summary_pos is not None and mm.start() >= summary_pos:
+                continue
+            # check if there's a code occurrence before this money
+            if any(code_pos < mm.start() for code_pos in code_iter):
+                normalized = _normalize_money_str(mm.group(0))
+                if normalized:
+                    if salary_str:
+                        try:
+                            if float(normalized) == float(salary_str):
+                                continue
+                        except Exception:
+                            pass
+                    return normalized
     return ""
 
 
@@ -336,14 +283,14 @@ def extrair_funcionarios(pdf_path):
 
                         dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
 
-                        adic_noturno_val = _extract_value_from_line_block_improved(bloco, '327', r'ADICIONAL\s*NOTURNO', salary_str=salario)
-                        # For night extras require both code and description to be present nearby to avoid false positives
-                        he_noturna_50_val = _extract_value_from_line_block_improved(bloco, '218', r'NOTURNO|NOT\.|NOT\s*URNO|H\.?\s*E\.?\s*NOT', salary_str=salario, require_both=True)
-                        he_noturna_100_val = _extract_value_from_line_block_improved(bloco, '358', r'NOTURNO|NOT\.|NOT\s*URNO|H\.?\s*E\.?\s*NOT', salary_str=salario, require_both=True)
-                        he_50_val = _extract_value_from_line_block_improved(bloco, '150', r'HORAS\s*EXTRAS\s*50%|HORAS\s*EXTRAS\s*50', salary_str=salario)
-                        he_100_val = _extract_value_from_line_block_improved(bloco, '200', r'HORAS\s*EXTRAS\s*100%|HORAS\s*EXTRAS\s*100', salary_str=salario)
-                        reflexo_adic_noturno_dsr_val = _extract_value_from_line_block_improved(bloco, '854', r'REFLEXO\s*ADIC.*NOTURNO', salary_str=salario)
-                        reflexo_extras_dsr_val = _extract_value_from_line_block_improved(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR', salary_str=salario)
+                        # Use strict code-based extraction for the rubricas you listed
+                        he_50_val = _extract_value_by_code_strict(bloco, '218', salary_str=salario)
+                        he_100_val = _extract_value_by_code_strict(bloco, '358', salary_str=salario)
+                        he50_normais_val = _extract_value_by_code_strict(bloco, '150', salary_str=salario)
+                        he100_normais_val = _extract_value_by_code_strict(bloco, '200', salary_str=salario)
+                        adic_not_val = _extract_value_by_code_strict(bloco, '327', salary_str=salario)
+                        reflexo_extras_dsr_val = _extract_value_by_code_strict(bloco, '250', salary_str=salario)
+                        reflexo_adic_not_dsr_val = _extract_value_by_code_strict(bloco, '854', salary_str=salario)
 
                         dados.append({
                             'Competência': competencia,
@@ -362,12 +309,12 @@ def extrair_funcionarios(pdf_path):
                             'Justificativa preencher em adm e dem': "",
                             'Admissão': admissao,
                             'Salário': formato_brasileiro(salario),
-                            'Adicional Noturno 20%': formato_brasileiro(adic_noturno_val),
-                            'HE Noturna 50% + Adic 20%': formato_brasileiro(he_noturna_50_val),
-                            'HE Noturna 100% + Adic 20%': formato_brasileiro(he_noturna_100_val),
-                            'Horas Extras 50%': formato_brasileiro(he_50_val),
-                            'Horas Extras 100%': formato_brasileiro(he_100_val),
-                            'Reflexo Adic Noturno DSR': formato_brasileiro(reflexo_adic_noturno_dsr_val),
+                            'Adicional Noturno 20%': formato_brasileiro(adic_not_val),
+                            'HE Noturna 50% + Adic 20%': formato_brasileiro(he_50_val),
+                            'HE Noturna 100% + Adic 20%': formato_brasileiro(he_100_val),
+                            'Horas Extras 50%': formato_brasileiro(he50_normais_val),
+                            'Horas Extras 100%': formato_brasileiro(he100_normais_val),
+                            'Reflexo Adic Noturno DSR': formato_brasileiro(reflexo_adic_not_dsr_val),
                             'Reflexo Extras DSR': formato_brasileiro(reflexo_extras_dsr_val),
                             'raw_block': bloco
                         })
