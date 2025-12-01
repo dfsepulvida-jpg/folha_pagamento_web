@@ -6,12 +6,26 @@ import os
 import tempfile
 import logging
 from werkzeug.utils import secure_filename
+from datetime import datetime
+from typing import Optional
 
 app = Flask(__name__)
 CORS(app)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _parse_date_ddmmyyyy(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
 
 
 def limpar_nome(bloco):
@@ -78,8 +92,8 @@ def limpar_empresa(texto):
     return ""
 
 
-def limpar_situacao(bloco):
-    situacao_match = re.search(r'Situação:\s*([A-Za-zçÇãÃâÂêÊôÔéÉíÍóÓúÚ\-\s]+)', bloco)
+def limpar_situacao_raw(bloco):
+    situacao_match = re.search(r'Situação:\s*([^\n\r]+)', bloco)
     if situacao_match:
         situacao = situacao_match.group(1).strip()
         situacao = situacao.split('CPF')[0].strip()
@@ -87,7 +101,44 @@ def limpar_situacao(bloco):
     return ""
 
 
+def normalize_situacao(situacao_raw: str, admissao_str: str, competencia_str: str) -> str:
+    """
+    Regras:
+    - Se admissão dentro do mês/ano da competência -> 'Admissão'
+    - Senão, se situacao_raw indicar demissão (contendo 'demit') -> 'Demissão'
+    - Senão, se situacao_raw indicar trabalhando/ativo -> 'Ativo'
+    - Senão, retorna o valor original (limpo e capitalizado)
+    """
+    admissao_date = _parse_date_ddmmyyyy(admissao_str)
+    competencia_date = _parse_date_ddmmyyyy(competencia_str)  # competencia_str expected like '01/11/2025'
+    # regra 1: admissão no mesmo mês/ano da competência
+    if admissao_date and competencia_date:
+        if admissao_date.year == competencia_date.year and admissao_date.month == competencia_date.month:
+            return "Admissão"
+
+    # normalizar texto para análise
+    s = (situacao_raw or "").strip()
+    s_lower = s.lower()
+
+    # regra demissão
+    if "demit" in s_lower or "deslig" in s_lower or "rescind" in s_lower:
+        return "Demissão"
+
+    # regra trabalhando/ativo
+    if "trabalh" in s_lower or "ativo" in s_lower or "empreg" in s_lower or "contrat" in s_lower:
+        return "Ativo"
+
+    # caso não enquadre, padronizar capitalização (primeira letra maiúscula)
+    return s.title() if s else ""
+
+
 def limpar_vinculo(bloco):
+    """
+    Extrai o vínculo e normaliza:
+    - Retorna apenas o primeiro token do campo 'Vínculo'
+    - Se o token for 'celetista' (qualquer caixa), retorna 'CLT'
+    - Caso contrário retorna o token tal qual (limpo)
+    """
     vinculo_match = re.search(r'Vínculo:\s*([^\n\r]+)', bloco, re.IGNORECASE)
     if not vinculo_match:
         return ""
@@ -156,10 +207,11 @@ def extrair_funcionarios(pdf_path):
                         bloco = "Empr.:" + func_raw
                         nome = limpar_nome(bloco)
                         cargo = limpar_cargo(bloco)
-                        situacao = limpar_situacao(bloco)
+                        admissao = limpar_admissao(bloco)
+                        situacao_raw = limpar_situacao_raw(bloco)
+                        situacao = normalize_situacao(situacao_raw, admissao, competencia)
                         vinculo = limpar_vinculo(bloco)
                         salario = limpar_salario(bloco)
-                        admissao = limpar_admissao(bloco)
                         dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
                         he_50 = extrair_campo_quantidade_flex(bloco, '150', r'HORAS\s*EXTRAS\s*50%')
                         he_100 = extrair_campo_quantidade_flex(bloco, '200', r'HORAS\s*EXTRAS\s*100%')
