@@ -157,68 +157,47 @@ def _normalize_money_str(s: str) -> Optional[str]:
         return None
 
 
-def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str) -> str:
+def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str, require_code: bool = False) -> str:
     """
-    Melhor heurística para retornar o VALOR monetário associado ao item (não a quantidade).
-    - Encontra a linha que contém o código OU a descrição.
-    - Coleta os valores monetários nessa linha e nas 1-2 linhas seguintes.
-    - Normalmente a ordem é: <descrição> <quantidade> <valor> ... <próximo item>
-      Então pegamos o SEGUNDO valor monetário encontrado na janela (índice 1).
-    - Se houver apenas 1 valor na janela, usamos esse valor (fallback).
-    - Retorna string com ponto decimal (ex: '417.40') ou "".
+    Heurística refinada para retornar o VALOR monetário associado ao item (não a quantidade).
+    - Se require_code=True, só retorna valor se o código (ex: '218') estiver presente em alguma linha.
+    - Procura a linha que contém o código OU a descrição (se require_code False também considera só descrição).
+    - Coleta valores monetários na linha e nas 1-2 linhas seguintes. Normalmente a ordem é:
+      <descrição> <quantidade> <valor>
+      Pegamos o SEGUNDO valor monetário na janela (índice 1) quando possível.
+    - Retorna string com ponto decimal ('417.40') ou "" quando não encontrado.
     """
     if not bloco:
         return ""
     lines = re.split(r'\r?\n', bloco)
-    money_regex = r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})'  # matches Brazilian money like 1.234,56 or 459,78
+    money_regex = r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})'
+
+    # Se for obrigatório, confirme que o código existe em alguma linha; caso não exista, retorna vazio
+    if require_code:
+        found_code = any(re.search(rf'\b{re.escape(code)}\b', line) for line in lines)
+        if not found_code:
+            return ""
 
     # procura linha que contenha o código ou a descrição
     for idx, line in enumerate(lines):
-        if re.search(rf'\b{re.escape(code)}\b', line) or re.search(desc_pattern, line, flags=re.IGNORECASE):
-            # janela: linha atual + próximas 2 linhas
+        has_code = bool(re.search(rf'\b{re.escape(code)}\b', line))
+        has_desc = bool(re.search(desc_pattern, line, flags=re.IGNORECASE))
+        if has_code or (has_desc and not require_code):
             window_text = ' '.join(lines[idx: idx + 3])
             money_matches = re.findall(money_regex, window_text)
-            # Se encontrou pelo menos 2 valores (quantidade + valor), pegar o segundo
             if len(money_matches) >= 2:
                 chosen = money_matches[1]
                 normalized = _normalize_money_str(chosen)
                 return normalized or ""
-            # Se encontrou apenas 1, provavelmente é o valor (ou não), usar como fallback
             if len(money_matches) == 1:
                 chosen = money_matches[0]
                 normalized = _normalize_money_str(chosen)
                 return normalized or ""
-            # Se não encontrou na janela, procurar no restante da linha (último valor)
             money_matches_full = re.findall(money_regex, line)
             if money_matches_full:
                 chosen = money_matches_full[-1]
                 normalized = _normalize_money_str(chosen)
                 return normalized or ""
-            # procurar nas próximas linhas individuais
-            for j in range(1, 4):
-                if idx + j < len(lines):
-                    nxt = lines[idx + j]
-                    money_matches_n = re.findall(money_regex, nxt)
-                    if money_matches_n:
-                        # preferir último valor na próxima linha
-                        chosen = money_matches_n[-1]
-                        normalized = _normalize_money_str(chosen)
-                        if normalized:
-                            return normalized
-            return ""
-    # fallback: procurar apenas pela descrição em qualquer linha e aplicar mesma lógica
-    for idx, line in enumerate(lines):
-        if re.search(desc_pattern, line, flags=re.IGNORECASE):
-            window_text = ' '.join(lines[idx: idx + 3])
-            money_matches = re.findall(money_regex, window_text)
-            if len(money_matches) >= 2:
-                chosen = money_matches[1]
-                normalized = _normalize_money_str(chosen)
-                return normalized or ""
-            if len(money_matches) == 1:
-                chosen = money_matches[0]
-                normalized = _normalize_money_str(chosen)
-                return normalized or ""
             for j in range(1, 4):
                 if idx + j < len(lines):
                     nxt = lines[idx + j]
@@ -229,6 +208,30 @@ def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str) -> 
                         if normalized:
                             return normalized
             return ""
+    # fallback: procurar apenas pela descrição em qualquer linha (se require_code == False)
+    if not require_code:
+        for idx, line in enumerate(lines):
+            if re.search(desc_pattern, line, flags=re.IGNORECASE):
+                window_text = ' '.join(lines[idx: idx + 3])
+                money_matches = re.findall(money_regex, window_text)
+                if len(money_matches) >= 2:
+                    chosen = money_matches[1]
+                    normalized = _normalize_money_str(chosen)
+                    return normalized or ""
+                if len(money_matches) == 1:
+                    chosen = money_matches[0]
+                    normalized = _normalize_money_str(chosen)
+                    return normalized or ""
+                for j in range(1, 4):
+                    if idx + j < len(lines):
+                        nxt = lines[idx + j]
+                        money_matches_n = re.findall(money_regex, nxt)
+                        if money_matches_n:
+                            chosen = money_matches_n[-1]
+                            normalized = _normalize_money_str(chosen)
+                            if normalized:
+                                return normalized
+                return ""
     return ""
 
 
@@ -268,14 +271,14 @@ def extrair_funcionarios(pdf_path):
 
                         dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
 
-                        # Extrair valores monetários a partir da linha correspondente (preferir o 2º valor na linha/janela)
-                        adic_noturno_val = _extract_value_from_line_block(bloco, '327', r'ADICIONAL\s*NOTURNO')
-                        he_noturna_50_val = _extract_value_from_line_block(bloco, '218', r'NOT.*50%|NOTURNO.*50%|H\.?\s*E\.?\s*NOT')
-                        he_noturna_100_val = _extract_value_from_line_block(bloco, '358', r'NOT.*100%|NOTURNO.*100%|HORAS?\s*EXTRAS?\s*NOT.*100%')
-                        he_50_val = _extract_value_from_line_block(bloco, '150', r'HORAS\s*EXTRAS\s*50%')
-                        he_100_val = _extract_value_from_line_block(bloco, '200', r'HORAS\s*EXTRAS\s*100%')
-                        reflexo_adic_noturno_dsr_val = _extract_value_from_line_block(bloco, '854', r'REFLEXO\s*ADIC.*NOTURNO')
-                        reflexo_extras_dsr_val = _extract_value_from_line_block(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR')
+                        # Extrair valores monetários; exigimos código para evitar falsos positivos
+                        adic_noturno_val = _extract_value_from_line_block(bloco, '327', r'ADICIONAL\s*NOTURNO', require_code=True)
+                        he_noturna_50_val = _extract_value_from_line_block(bloco, '218', r'NOT.*50%|NOTURNO.*50%|H\.?\s*E\.?\s*NOT', require_code=True)
+                        he_noturna_100_val = _extract_value_from_line_block(bloco, '358', r'NOT.*100%|NOTURNO.*100%|HORAS?\s*EXTRAS?\s*NOT.*100%', require_code=True)
+                        he_50_val = _extract_value_from_line_block(bloco, '150', r'HORAS\s*EXTRAS\s*50%', require_code=True)
+                        he_100_val = _extract_value_from_line_block(bloco, '200', r'HORAS\s*EXTRAS\s*100%', require_code=True)
+                        reflexo_adic_noturno_dsr_val = _extract_value_from_line_block(bloco, '854', r'REFLEXO\s*ADIC.*NOTURNO', require_code=True)
+                        reflexo_extras_dsr_val = _extract_value_from_line_block(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR', require_code=True)
 
                         dados.append({
                             'Competência': competencia,
