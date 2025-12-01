@@ -7,7 +7,7 @@ import tempfile
 import logging
 from werkzeug.utils import secure_filename
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 
 app = Flask(__name__)
 CORS(app)
@@ -157,54 +157,43 @@ def _normalize_money_str(s: str) -> Optional[str]:
         return None
 
 
-def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str, require_code: bool = False) -> str:
+def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str) -> str:
     """
-    Heurística refinada para retornar o VALOR monetário associado ao item (não a quantidade).
-
-    Melhorias aplicadas:
-    - Se require_code=True, validamos primeiro se o código existe no bloco. Se não existir, retornamos vazio.
-    - Para evitar falsos positivos pegando valores de outras colunas, tentamos PRIMEIRO capturar
-      o padrão 'QUANTIDADE <espaço> VALOR' na MESMA LINHA (ou janelas próximas). Exemplo:
-         "218 H. E. NOT. 50% + AD. 20%  10,10  219,41 P"
-      Nesse caso pegamos '219,41' (o valor) e ignoramos '10,10' (a quantidade).
-    - Se não encontrarmos o par quantidade+valor, usamos a heurística anterior (último/segundo valor na janela).
+    Heurística para retornar o VALOR monetário associado ao item (não a quantidade).
+    - Encontra a linha que contém o código (ou a descrição).
+    - Coleta os valores monetários nessa linha e nas 1-2 linhas seguintes.
+    - Normalmente a ordem é: <descrição> <quantidade> <valor>
+      Então pegamos o SEGUNDO valor monetário encontrado na janela (índice 1).
+    - Se houver apenas 1 valor na janela, usamos esse valor (fallback).
+    - Retorna string com ponto decimal (ex: '417.40') ou "".
     """
     if not bloco:
         return ""
     lines = re.split(r'\r?\n', bloco)
-    # moeda no formato brasileiro (1.234,56 ou 459,78)
     money_regex = r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})'
-    qty_or_num_regex = r'[\d]+[.,][\d]+'  # quantidade como 10,10 ou 2,54 etc.
-
-    # Se for obrigatório, confirme que o código existe em alguma linha; caso não exista, retorna vazio
-    if require_code:
-        found_code = any(re.search(rf'\b{re.escape(code)}\b', line) for line in lines)
-        if not found_code:
-            return ""
 
     # procura linha que contenha o código ou a descrição
     for idx, line in enumerate(lines):
-        has_code = bool(re.search(rf'\b{re.escape(code)}\b', line))
-        has_desc = bool(re.search(desc_pattern, line, flags=re.IGNORECASE))
-        if has_code or (has_desc and not require_code):
-            # 1) tentativa forte: procurar "quantidade + valor" na própria linha
-            m_pair = re.search(rf'({qty_or_num_regex})\s+({money_regex})', line)
-            if m_pair:
-                chosen = m_pair.group(2)
-                normalized = _normalize_money_str(chosen)
-                if normalized:
-                    return normalized
-
-            # 2) procurar na janela (linha atual + próximas 2 linhas) por quantidade+valor
+        if re.search(rf'\b{re.escape(code)}\b', line) or re.search(desc_pattern, line, flags=re.IGNORECASE):
+            # janela: linha atual + próximas 2 linhas
             window_text = ' '.join(lines[idx: idx + 3])
-            m_pair_w = re.search(rf'({qty_or_num_regex})\s+({money_regex})', window_text)
-            if m_pair_w:
-                chosen = m_pair_w.group(2)
+            money_matches = re.findall(money_regex, window_text)
+            # Se encontrou pelo menos 2 valores (quantidade + valor), pegar o segundo
+            if len(money_matches) >= 2:
+                chosen = money_matches[1]
                 normalized = _normalize_money_str(chosen)
-                if normalized:
-                    return normalized
-
-            # 3) fallback: coletar valores monetários na janela e escolher o segundo (quantidade + valor)
+                return normalized or ""
+            # Se encontrou apenas 1, provavelmente é o valor (ou não), usar como fallback
+            if len(money_matches) == 1:
+                chosen = money_matches[0]
+                normalized = _normalize_money_str(chosen)
+                return normalized or ""
+            # Se não encontrou na janela, retornar vazio
+            return ""
+    # fallback: tentar apenas pela descrição em qualquer linha
+    for idx, line in enumerate(lines):
+        if re.search(desc_pattern, line, flags=re.IGNORECASE):
+            window_text = ' '.join(lines[idx: idx + 3])
             money_matches = re.findall(money_regex, window_text)
             if len(money_matches) >= 2:
                 chosen = money_matches[1]
@@ -214,26 +203,7 @@ def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str, req
                 chosen = money_matches[0]
                 normalized = _normalize_money_str(chosen)
                 return normalized or ""
-
-            # 4) procurar no resto da linha apenas (último valor)
-            money_matches_full = re.findall(money_regex, line)
-            if money_matches_full:
-                chosen = money_matches_full[-1]
-                normalized = _normalize_money_str(chosen)
-                return normalized or ""
-
-            # 5) verificar próximas linhas individualmente (último valor)
-            for j in range(1, 4):
-                if idx + j < len(lines):
-                    nxt = lines[idx + j]
-                    money_matches_n = re.findall(money_regex, nxt)
-                    if money_matches_n:
-                        chosen = money_matches_n[-1]
-                        normalized = _normalize_money_str(chosen)
-                        if normalized:
-                            return normalized
             return ""
-    # fallback geral: nada encontrado
     return ""
 
 
@@ -273,14 +243,14 @@ def extrair_funcionarios(pdf_path):
 
                         dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
 
-                        # Extrair valores monetários; exigimos código para evitar falsos positivos
-                        adic_noturno_val = _extract_value_from_line_block(bloco, '327', r'ADICIONAL\s*NOTURNO', require_code=True)
-                        he_noturna_50_val = _extract_value_from_line_block(bloco, '218', r'NOT.*50%|NOTURNO.*50%|H\.?\s*E\.?\s*NOT', require_code=True)
-                        he_noturna_100_val = _extract_value_from_line_block(bloco, '358', r'NOT.*100%|NOTURNO.*100%|HORAS?\s*EXTRAS?\s*NOT.*100%', require_code=True)
-                        he_50_val = _extract_value_from_line_block(bloco, '150', r'HORAS\s*EXTRAS\s*50%', require_code=True)
-                        he_100_val = _extract_value_from_line_block(bloco, '200', r'HORAS\s*EXTRAS\s*100%', require_code=True)
-                        reflexo_adic_noturno_dsr_val = _extract_value_from_line_block(bloco, '854', r'REFLEXO\s*ADIC.*NOTURNO', require_code=True)
-                        reflexo_extras_dsr_val = _extract_value_from_line_block(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR', require_code=True)
+                        # Extrair valores monetários usando heurística que pega o 2º valor na janela
+                        adic_noturno_val = _extract_value_from_line_block(bloco, '327', r'ADICIONAL\s*NOTURNO')
+                        he_noturna_50_val = _extract_value_from_line_block(bloco, '218', r'NOT.*50%|NOTURNO.*50%|H\.?\s*E\.?\s*NOT')
+                        he_noturna_100_val = _extract_value_from_line_block(bloco, '358', r'NOT.*100%|NOTURNO.*100%|HORAS?\s*EXTRAS?\s*NOT.*100%')
+                        he_50_val = _extract_value_from_line_block(bloco, '150', r'HORAS\s*EXTRAS\s*50%')
+                        he_100_val = _extract_value_from_line_block(bloco, '200', r'HORAS\s*EXTRAS\s*100%')
+                        reflexo_adic_noturno_dsr_val = _extract_value_from_line_block(bloco, '854', r'REFLEXO\s*ADIC.*NOTURNO')
+                        reflexo_extras_dsr_val = _extract_value_from_line_block(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR')
 
                         dados.append({
                             'Competência': competencia,
