@@ -26,40 +26,36 @@ def limpar_nome(bloco):
 
 def limpar_cargo(bloco):
     """
-    Extrai o cargo e remove qualquer ocorrência/ruído relativo a C.B.O.
-    Geralmente o marcador 'C.B.O' pertence a outro campo; garantimos que:
-    - qualquer variante de 'C.B.O' (com/sem pontos, com ou sem dois-pontos) seja removida,
-    - e tudo que vier imediatamente após (números/ponctuação) também seja descartado.
-    Mantemos o restante do cargo e normalizamos espaços.
+    Extrai o cargo evitando que números de código, 'FILIAL', 'SALÁRIO', 'C.B.O' ou campos adjacentes
+    sejam incorporados ao texto do cargo. Retorna o cargo em MAIÚSCULAS (compatível com saída anterior).
     """
     if not bloco:
         return ""
-    # Captura o conteúdo depois de 'Cargo:' até a quebra de linha ou fim do bloco
-    m = re.search(r'Cargo:\s*(.+?)(?:\n|$)', bloco, re.IGNORECASE | re.DOTALL)
+    # Captura o conteúdo depois de 'Cargo:' até um delimitador previsível:
+    # - número + FILIAL:, FILIAL:, SAL...:, C.B.O, CBO, Vínculo:, nova linha ou fim
+    pattern = r'Cargo:\s*(.+?)(?=(?:\d{1,4}\s*FILIAL:|FILIAL:|SAL[^:]{0,20}:|C\.?B\.?O\.?|CBO\b|Vínculo:|\n|$))'
+    m = re.search(pattern, bloco, flags=re.IGNORECASE | re.DOTALL)
     if not m:
         return ""
     cargo_raw = m.group(1).strip()
 
-    # Remove padrões de C.B.O em diversas formas:
-    # Ex.: "C.B.O", "C.B.O.", "C B O", "C B O:", "C.B.O: 123", etc.
-    # Também remove eventuais sufixos numéricos ou pontuação imediatamente após.
-    cargo_clean = re.sub(r'\bC\.?\s*B\.?\s*O\.?\b[:\s\.\-0-9]*', '', cargo_raw, flags=re.IGNORECASE)
+    # Remover prefixos numéricos grudados (ex: "269ANALISTA ..." ou "115ASSISTENTE ...")
+    cargo_raw = re.sub(r'^[\d\.\-:\s]+', '', cargo_raw)
 
-    # Em alguns PDFs o marcador vem separado por ponto ou sem espaços - aplicar remoção extra
+    # Remover variantes de C.B.O e quaisquer dígitos/pontos/traços que venham depois
+    cargo_clean = re.sub(r'\bC\.?\s*B\.?\s*O\.?\b[:\s\.\-0-9]*', '', cargo_raw, flags=re.IGNORECASE)
     cargo_clean = re.sub(r'\bCBO\b[:\s\.\-0-9]*', '', cargo_clean, flags=re.IGNORECASE)
 
-    # Remover restos como ' :', trailing hyphens, ou múltiplos espaços
+    # Remover possíveis porções 'FILIAL:1' que fiquem misturadas ao cargo
+    cargo_clean = re.sub(r'\bFILIAL[:\s\.\-0-9A-Za-z]*', '', cargo_clean, flags=re.IGNORECASE)
+
+    # Remover porção de salário caso tenha sobrado (ex: 'SALÁRIO: 4.160,00')
+    cargo_clean = re.sub(r'SAL[^:]{0,20}:.*$', '', cargo_clean, flags=re.IGNORECASE)
+
+    # Limpeza final de espaços e caracteres remanescentes
     cargo_clean = re.sub(r'[:\-\s]+$', '', cargo_clean)
     cargo_clean = re.sub(r'\s+', ' ', cargo_clean).strip()
 
-    # Se o cargo for numérico ou vazio após limpeza, tentar fallback que pega até 'C.B.O' explícito
-    if cargo_clean == "":
-        fb = re.search(r'Cargo:\s*(.*?)C\.?\.?B\.?\.?O\.?', bloco, re.IGNORECASE | re.DOTALL)
-        if fb:
-            cargo_clean = fb.group(1).strip()
-            cargo_clean = re.sub(r'\s+', ' ', cargo_clean)
-
-    # Manter em maiúsculas (compatível com saída anterior)
     return cargo_clean.upper() if cargo_clean else ""
 
 
@@ -92,12 +88,6 @@ def limpar_situacao(bloco):
 
 
 def limpar_vinculo(bloco):
-    """
-    Extrai o vínculo e normaliza:
-    - Retorna apenas o primeiro token do campo 'Vínculo'
-    - Se o token for 'celetista' (qualquer caixa), retorna 'CLT'
-    - Caso contrário retorna o token tal qual (limpo)
-    """
     vinculo_match = re.search(r'Vínculo:\s*([^\n\r]+)', bloco, re.IGNORECASE)
     if not vinculo_match:
         return ""
