@@ -113,7 +113,7 @@ def normalize_situacao(situacao_raw: str, admissao_str: str, competencia_str: st
     - Senão, retorna o valor original (limpo e capitalizado)
     """
     admissao_date = _parse_date_ddmmyyyy(admissao_str)
-    competencia_date = _parse_date_ddmmyyyy(competencia_str)  # competencia_str expected like '01/11/2025'
+    competencia_date = _parse_date_ddmmyyyy(competencia_str)  # competence formatted like '01/11/2025'
     # regra 1: admissão no mesmo mês/ano da competência
     if admissao_date and competencia_date:
         if admissao_date.year == competencia_date.year and admissao_date.month == competencia_date.month:
@@ -177,42 +177,54 @@ def extrair_campo_quantidade_flex(bloco, codigo, texto):
     return match.group(1).replace(',', '.') if match else ""
 
 
-# NEW: extract monetary values that appear to the right ("coluna da frente") after the matched label
-def _extract_money_list_after(bloco: str, codigo: str, texto_pattern: str, max_matches: int = 8) -> List[str]:
+def _extract_money_after(bloco: str, codigo: str, texto_pattern: str, window: int = 200) -> Optional[str]:
     """
-    Busca a ocorrência do código + texto e captura valores monetários encontrados a seguir no bloco.
-    Retorna lista de strings normalizadas com ponto decimal (e.g. '1234.56').
-    Heurística: procura padrões tipo '1.234,56' ou '459,78' e normaliza.
+    Heurística aprimorada para capturar o valor monetário associado à linha do código/descrição,
+    pegando o último valor monetário encontrado na "janela" imediatamente após o label.
+    Isso evita capturar a quantidade de horas (ex: 19,01) como se fosse o valor monetário,
+    porque o valor desejado normalmente aparece depois desta quantidade na mesma linha.
+
+    - bloco: texto do funcionário
+    - codigo: código numérico que precede o label (ex: '150', '250', etc.)
+    - texto_pattern: parte do texto descritivo (regex) que descreve o item
+    - window: quantos caracteres após o fim do match serão analisados
+    Retorna string normalizada com ponto decimal (ex: '417.40') ou "" se não encontrado.
     """
     if not bloco:
-        return []
+        return ""
     try:
+        # procura código + descrição primeiro; se não achar, tenta só pela descrição
         pat = re.compile(rf"{re.escape(str(codigo))}\s*{texto_pattern}", flags=re.IGNORECASE)
         m = pat.search(bloco)
         if not m:
-            # Tentativa alternativa sem código (algumas folhas podem não ter o código)
             pat2 = re.compile(texto_pattern, flags=re.IGNORECASE)
             m = pat2.search(bloco)
             if not m:
-                return []
+                return ""
         tail = bloco[m.end():]
-        # primeiro, procura valores no formato brasileiro com centavos (ex: 1.234,56 ou 459,78)
-        money_matches = re.findall(r'(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d{2})', tail)
-        # se não achar, captura números com decimal ponto ou vírgula
+        window_text = tail[:window]
+
+        # procura valores no formato brasileiro com centavos (1.234,56 ou 459,78)
+        money_matches = re.findall(r'(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d{2})', window_text)
+        # fallback mais permissivo se nada encontrado
         if not money_matches:
-            money_matches = re.findall(r'[\d]+[.,][\d]+', tail)
-        results = []
-        for s in money_matches[:max_matches]:
-            s_norm = s.replace('.', '').replace(',', '.')
-            try:
-                v = float(s_norm)
-                results.append(f"{v:.2f}")
-            except Exception:
-                continue
-        return results
+            money_matches = re.findall(r'[\d]+[.,][\d]+', window_text)
+
+        if not money_matches:
+            return ""
+
+        # escolher o último valor encontrado dentro da janela
+        chosen = money_matches[-1]
+        # normalizar para formato ponto decimal interno
+        chosen_norm = chosen.replace('.', '').replace(',', '.')
+        try:
+            v = float(chosen_norm)
+            return f"{v:.2f}"
+        except Exception:
+            return ""
     except Exception as e:
-        logger.exception("Erro em _extract_money_list_after: %s", e)
-        return []
+        logger.exception("Erro em _extract_money_after: %s", e)
+        return ""
 
 
 def formato_brasileiro(valor):
@@ -251,21 +263,17 @@ def extrair_funcionarios(pdf_path):
 
                         # Quantidades originais (horas, dias)
                         dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
-                        # valores monetários: buscamos "coluna da frente" após cada marcador
-                        # Map: code/text -> we try to capture monetary values after the label and pick the first (heurística).
-                        def first_money(code, desc_pattern):
-                            vals = _extract_money_list_after(bloco, code, desc_pattern, max_matches=6)
-                            return vals[0] if vals else ""
 
-                        adic_noturno_val = first_money('327', r'ADICIONAL\s*NOTURNO\s*20%')
-                        he_noturna_50_val = first_money('218', r'H\.?\s*E\.?\s*NOT\.?\s*50%\s*\+\s*AD\.?\s*20%')
-                        # NEW: HE Noturna 100% + Adic 20% (código sugerido pelo seu exemplo: 358)
-                        he_noturna_100_val = first_money('358', r'HORA[S]?\s*EXTRAS?\s*NOT.*100%.*ADICIONAL|HORAS?\s*EXTRAS?\s*NOT.*100%.*ADICIONAL|HORAS\s*EXTRAS\s*NOT\s*100%.*ADICIONAL')
-                        he_noturna_100_val = he_noturna_100_val or first_money('358', r'HORAS\s*EXTRAS\s*NOT\s*100%')  # fallback
-                        he_50_val = first_money('150', r'HORAS\s*EXTRAS\s*50%')
-                        he_100_val = first_money('200', r'HORAS\s*EXTRAS\s*100%')
-                        reflexo_adic_noturno_dsr_val = first_money('854', r'REFLEXO\s*ADIC\.?\s*NOTURNO\s*DSR')
-                        reflexo_extras_dsr_val = first_money('250', r'REFLEXO\s*EXTRAS\s*DSR')
+                        # Captura valores monetários na "coluna da frente" usando heurística de janela
+                        adic_noturno_val = _extract_money_after(bloco, '327', r'ADICIONAL\s*NOTURNO\s*20%')
+                        he_noturna_50_val = _extract_money_after(bloco, '218', r'H\.?\s*E\.?\s*NOT\.?\s*50%\s*\+\s*AD\.?\s*20%')
+                        # HE Noturna 100% + Adic 20% (código 358 no seu exemplo)
+                        he_noturna_100_val = _extract_money_after(bloco, '358', r'NOT.*100%.*ADIC|NOT.*100%|HORAS?\s*EXTRAS?\s*NOT.*100%|HORAS\s*EXTRAS\s*NOT\s*100%')
+                        # Horas extras 50% / 100%
+                        he_50_val = _extract_money_after(bloco, '150', r'HORAS\s*EXTRAS\s*50%')
+                        he_100_val = _extract_money_after(bloco, '200', r'HORAS\s*EXTRAS\s*100%')
+                        reflexo_adic_noturno_dsr_val = _extract_money_after(bloco, '854', r'REFLEXO\s*ADIC\.?\s*NOTURNO\s*DSR')
+                        reflexo_extras_dsr_val = _extract_money_after(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR')
 
                         dados.append({
                             'Competência': competencia,
