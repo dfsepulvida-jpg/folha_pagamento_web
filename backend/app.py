@@ -39,17 +39,12 @@ def limpar_nome(bloco):
 
 
 def limpar_cargo(bloco):
-    """
-    Extrai o cargo evitando que números de código, 'FILIAL', 'SALÁRIO', 'C.B.O' ou campos adjacentes
-    sejam incorporados ao texto do cargo. Retorna o cargo em MAIÚSCULAS.
-    """
+    # Extrai cargo evitando que campos adjacentes (C.B.O, FILIAL, SALÁRIO, códigos) sejam incorporados.
     if not bloco:
         return ""
-    # Captura texto após 'Cargo:' até um delimitador provável (FILIAL, SALÁRIO, C.B.O, Vínculo, newline)
     pattern = r'Cargo:\s*(.+?)(?=(?:\d{1,4}\s*FILIAL:|FILIAL:|SAL[^:]{0,20}:|C\.?B\.?O\.?|CBO\b|Vínculo:|\n|$))'
     m = re.search(pattern, bloco, flags=re.IGNORECASE | re.DOTALL)
     if not m:
-        # fallback: pega até 'C.B.O' se presente
         fb = re.search(r'Cargo:\s*(.*?)C\.?\.?B\.?\.?O', bloco, re.IGNORECASE | re.DOTALL)
         if fb:
             cargo_raw = fb.group(1).strip()
@@ -58,20 +53,11 @@ def limpar_cargo(bloco):
     else:
         cargo_raw = m.group(1).strip()
 
-    # Remover prefixos numéricos grudados (ex: "269ANALISTA ..." ou "115ASSISTENTE ...")
     cargo_raw = re.sub(r'^[\d\.\-:\s]+', '', cargo_raw)
-
-    # Remover variantes de C.B.O e quaisquer dígitos/pontos/traços que venham depois
     cargo_clean = re.sub(r'\bC\.?\s*B\.?\s*O\.?\b[:\s\.\-0-9A-Za-z]*', '', cargo_raw, flags=re.IGNORECASE)
     cargo_clean = re.sub(r'\bCBO\b[:\s\.\-0-9A-Za-z]*', '', cargo_clean, flags=re.IGNORECASE)
-
-    # Remover possíveis porções 'FILIAL:1' que fiquem misturadas ao cargo
     cargo_clean = re.sub(r'\bFILIAL[:\s\.\-0-9A-Za-z]*', '', cargo_clean, flags=re.IGNORECASE)
-
-    # Remover porção de salário caso tenha sobrado (ex: 'SALÁRIO: 4.160,00')
     cargo_clean = re.sub(r'SAL[^:]{0,20}:.*$', '', cargo_clean, flags=re.IGNORECASE)
-
-    # Limpeza final de espaços e caracteres remanescentes
     cargo_clean = re.sub(r'[:\-\s]+$', '', cargo_clean)
     cargo_clean = re.sub(r'\s+', ' ', cargo_clean).strip()
 
@@ -79,17 +65,12 @@ def limpar_cargo(bloco):
 
 
 def limpar_empresa(texto):
-    """
-    Extrai o nome da empresa e remove prefixos do tipo '1234 - ' quando presentes.
-    """
     if not texto:
         return ""
     emp_match = re.search(r'Empresa:\s*([^\n\r]+)', texto)
     if emp_match:
         emp = emp_match.group(1).strip()
-        # Remover prefixo formado por 4 números, espaço, traço, espaço (ex: '1234 - ')
         emp = re.sub(r'^\d{4}\s-\s', '', emp)
-        # Remover elementos de paginação que possam ter sido colados
         emp = re.sub(r'Página.*', '', emp, flags=re.IGNORECASE).strip()
         return ' '.join(emp.split())
     return ""
@@ -105,33 +86,21 @@ def limpar_situacao_raw(bloco):
 
 
 def normalize_situacao(situacao_raw: str, admissao_str: str, competencia_str: str) -> str:
-    """
-    Regras:
-    - Se admissão dentro do mês/ano da competência -> 'Admissão'
-    - Senão, se situacao_raw indicar demissão (contendo 'demit') -> 'Demissão'
-    - Senão, se situacao_raw indicar trabalhando/ativo -> 'Ativo'
-    - Senão, retorna o valor original (limpo e capitalizado)
-    """
     admissao_date = _parse_date_ddmmyyyy(admissao_str)
-    competencia_date = _parse_date_ddmmyyyy(competencia_str)  # competence formatted like '01/11/2025'
-    # regra 1: admissão no mesmo mês/ano da competência
+    competencia_date = _parse_date_ddmmyyyy(competencia_str)  # '01/MM/YYYY'
     if admissao_date and competencia_date:
         if admissao_date.year == competencia_date.year and admissao_date.month == competencia_date.month:
             return "Admissão"
 
-    # normalizar texto para análise
     s = (situacao_raw or "").strip()
     s_lower = s.lower()
 
-    # regra demissão
     if "demit" in s_lower or "deslig" in s_lower or "rescind" in s_lower:
         return "Demissão"
 
-    # regra trabalhando/ativo
     if "trabalh" in s_lower or "ativo" in s_lower or "empreg" in s_lower or "contrat" in s_lower:
         return "Ativo"
 
-    # caso não enquadre, padronizar capitalização (primeira letra maiúscula)
     return s.title() if s else ""
 
 
@@ -177,54 +146,72 @@ def extrair_campo_quantidade_flex(bloco, codigo, texto):
     return match.group(1).replace(',', '.') if match else ""
 
 
-def _extract_money_after(bloco: str, codigo: str, texto_pattern: str, window: int = 200) -> Optional[str]:
-    """
-    Heurística aprimorada para capturar o valor monetário associado à linha do código/descrição,
-    pegando o último valor monetário encontrado na "janela" imediatamente após o label.
-    Isso evita capturar a quantidade de horas (ex: 19,01) como se fosse o valor monetário,
-    porque o valor desejado normalmente aparece depois desta quantidade na mesma linha.
+def _normalize_money_str(s: str) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    s = s.replace('.', '').replace(',', '.')
+    try:
+        v = float(s)
+        return f"{v:.2f}"
+    except Exception:
+        return None
 
-    - bloco: texto do funcionário
-    - codigo: código numérico que precede o label (ex: '150', '250', etc.)
-    - texto_pattern: parte do texto descritivo (regex) que descreve o item
-    - window: quantos caracteres após o fim do match serão analisados
-    Retorna string normalizada com ponto decimal (ex: '417.40') ou "" se não encontrado.
+
+def _extract_money_from_line_block(bloco: str, code: str, desc_pattern: str) -> str:
+    """
+    Procura a linha que contém o código (ou a descrição) e retorna o último valor monetário
+    encontrado nessa linha (ou na próxima linha, se necessário). Isso tende a devolver o valor
+    que está na "coluna da frente" (após a quantidade).
     """
     if not bloco:
         return ""
-    try:
-        # procura código + descrição primeiro; se não achar, tenta só pela descrição
-        pat = re.compile(rf"{re.escape(str(codigo))}\s*{texto_pattern}", flags=re.IGNORECASE)
-        m = pat.search(bloco)
-        if not m:
-            pat2 = re.compile(texto_pattern, flags=re.IGNORECASE)
-            m = pat2.search(bloco)
-            if not m:
-                return ""
-        tail = bloco[m.end():]
-        window_text = tail[:window]
-
-        # procura valores no formato brasileiro com centavos (1.234,56 ou 459,78)
-        money_matches = re.findall(r'(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d{2})', window_text)
-        # fallback mais permissivo se nada encontrado
-        if not money_matches:
-            money_matches = re.findall(r'[\d]+[.,][\d]+', window_text)
-
-        if not money_matches:
+    # dividir em linhas preservando ordem
+    lines = re.split(r'\r?\n', bloco)
+    money_regex = r'(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d{2})'
+    # percorre as linhas procurando a que contenha o código ou a descrição
+    for idx, line in enumerate(lines):
+        # busca pelo código como palavra inteira ou pela descrição
+        if re.search(rf'\b{re.escape(code)}\b', line) or re.search(desc_pattern, line, flags=re.IGNORECASE):
+            # procurar valores monetários na própria linha (preferir último)
+            money_matches = re.findall(money_regex, line)
+            if money_matches:
+                chosen = money_matches[-1]
+                normalized = _normalize_money_str(chosen)
+                if normalized:
+                    return normalized
+            # se não encontrou na mesma linha, olhar nas próximas 2 linhas (coluna deslocada)
+            for j in range(1, 3):
+                if idx + j < len(lines):
+                    nxt = lines[idx + j]
+                    money_matches = re.findall(money_regex, nxt)
+                    if money_matches:
+                        chosen = money_matches[-1]
+                        normalized = _normalize_money_str(chosen)
+                        if normalized:
+                            return normalized
+            # se nada encontrado, retornar vazio
             return ""
-
-        # escolher o último valor encontrado dentro da janela
-        chosen = money_matches[-1]
-        # normalizar para formato ponto decimal interno
-        chosen_norm = chosen.replace('.', '').replace(',', '.')
-        try:
-            v = float(chosen_norm)
-            return f"{v:.2f}"
-        except Exception:
+    # fallback: tenta encontrar apenas pela descrição em qualquer linha
+    for idx, line in enumerate(lines):
+        if re.search(desc_pattern, line, flags=re.IGNORECASE):
+            money_matches = re.findall(money_regex, line)
+            if money_matches:
+                chosen = money_matches[-1]
+                normalized = _normalize_money_str(chosen)
+                if normalized:
+                    return normalized
+            for j in range(1, 3):
+                if idx + j < len(lines):
+                    nxt = lines[idx + j]
+                    money_matches = re.findall(money_regex, nxt)
+                    if money_matches:
+                        chosen = money_matches[-1]
+                        normalized = _normalize_money_str(chosen)
+                        if normalized:
+                            return normalized
             return ""
-    except Exception as e:
-        logger.exception("Erro em _extract_money_after: %s", e)
-        return ""
+    return ""
 
 
 def formato_brasileiro(valor):
@@ -261,19 +248,17 @@ def extrair_funcionarios(pdf_path):
                         vinculo = limpar_vinculo(bloco)
                         salario = limpar_salario(bloco)
 
-                        # Quantidades originais (horas, dias)
                         dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
 
-                        # Captura valores monetários na "coluna da frente" usando heurística de janela
-                        adic_noturno_val = _extract_money_after(bloco, '327', r'ADICIONAL\s*NOTURNO\s*20%')
-                        he_noturna_50_val = _extract_money_after(bloco, '218', r'H\.?\s*E\.?\s*NOT\.?\s*50%\s*\+\s*AD\.?\s*20%')
-                        # HE Noturna 100% + Adic 20% (código 358 no seu exemplo)
-                        he_noturna_100_val = _extract_money_after(bloco, '358', r'NOT.*100%.*ADIC|NOT.*100%|HORAS?\s*EXTRAS?\s*NOT.*100%|HORAS\s*EXTRAS\s*NOT\s*100%')
-                        # Horas extras 50% / 100%
-                        he_50_val = _extract_money_after(bloco, '150', r'HORAS\s*EXTRAS\s*50%')
-                        he_100_val = _extract_money_after(bloco, '200', r'HORAS\s*EXTRAS\s*100%')
-                        reflexo_adic_noturno_dsr_val = _extract_money_after(bloco, '854', r'REFLEXO\s*ADIC\.?\s*NOTURNO\s*DSR')
-                        reflexo_extras_dsr_val = _extract_money_after(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR')
+                        # Extrair valores monetários a partir da linha correspondente (último valor na linha)
+                        adic_noturno_val = _extract_money_from_line_block(bloco, '327', r'ADICIONAL\s*NOTURNO')
+                        he_noturna_50_val = _extract_money_from_line_block(bloco, '218', r'NOT.*50%|NOTURNO.*50%|H\.?\s*E\.?\s*NOT')
+                        # HE Noturna 100% + Adic 20% (código 358 / descrição similar)
+                        he_noturna_100_val = _extract_money_from_line_block(bloco, '358', r'NOT.*100%|NOTURNO.*100%|HORAS?\s*EXTRAS?\s*NOT.*100%')
+                        he_50_val = _extract_money_from_line_block(bloco, '150', r'HORAS\s*EXTRAS\s*50%')
+                        he_100_val = _extract_money_from_line_block(bloco, '200', r'HORAS\s*EXTRAS\s*100%')
+                        reflexo_adic_noturno_dsr_val = _extract_money_from_line_block(bloco, '854', r'REFLEXO\s*ADIC.*NOTURNO')
+                        reflexo_extras_dsr_val = _extract_money_from_line_block(bloco, '250', r'REFLEXO\s*EXTRAS\s*DSR')
 
                         dados.append({
                             'Competência': competencia,
