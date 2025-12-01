@@ -160,17 +160,21 @@ def _normalize_money_str(s: str) -> Optional[str]:
 def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str, require_code: bool = False) -> str:
     """
     Heurística refinada para retornar o VALOR monetário associado ao item (não a quantidade).
-    - Se require_code=True, só retorna valor se o código (ex: '218') estiver presente em alguma linha.
-    - Procura a linha que contém o código OU a descrição (se require_code False também considera só descrição).
-    - Coleta valores monetários na linha e nas 1-2 linhas seguintes. Normalmente a ordem é:
-      <descrição> <quantidade> <valor>
-      Pegamos o SEGUNDO valor monetário na janela (índice 1) quando possível.
-    - Retorna string com ponto decimal ('417.40') ou "" quando não encontrado.
+
+    Melhorias aplicadas:
+    - Se require_code=True, validamos primeiro se o código existe no bloco. Se não existir, retornamos vazio.
+    - Para evitar falsos positivos pegando valores de outras colunas, tentamos PRIMEIRO capturar
+      o padrão 'QUANTIDADE <espaço> VALOR' na MESMA LINHA (ou janelas próximas). Exemplo:
+         "218 H. E. NOT. 50% + AD. 20%  10,10  219,41 P"
+      Nesse caso pegamos '219,41' (o valor) e ignoramos '10,10' (a quantidade).
+    - Se não encontrarmos o par quantidade+valor, usamos a heurística anterior (último/segundo valor na janela).
     """
     if not bloco:
         return ""
     lines = re.split(r'\r?\n', bloco)
+    # moeda no formato brasileiro (1.234,56 ou 459,78)
     money_regex = r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})'
+    qty_or_num_regex = r'[\d]+[.,][\d]+'  # quantidade como 10,10 ou 2,54 etc.
 
     # Se for obrigatório, confirme que o código existe em alguma linha; caso não exista, retorna vazio
     if require_code:
@@ -183,7 +187,24 @@ def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str, req
         has_code = bool(re.search(rf'\b{re.escape(code)}\b', line))
         has_desc = bool(re.search(desc_pattern, line, flags=re.IGNORECASE))
         if has_code or (has_desc and not require_code):
+            # 1) tentativa forte: procurar "quantidade + valor" na própria linha
+            m_pair = re.search(rf'({qty_or_num_regex})\s+({money_regex})', line)
+            if m_pair:
+                chosen = m_pair.group(2)
+                normalized = _normalize_money_str(chosen)
+                if normalized:
+                    return normalized
+
+            # 2) procurar na janela (linha atual + próximas 2 linhas) por quantidade+valor
             window_text = ' '.join(lines[idx: idx + 3])
+            m_pair_w = re.search(rf'({qty_or_num_regex})\s+({money_regex})', window_text)
+            if m_pair_w:
+                chosen = m_pair_w.group(2)
+                normalized = _normalize_money_str(chosen)
+                if normalized:
+                    return normalized
+
+            # 3) fallback: coletar valores monetários na janela e escolher o segundo (quantidade + valor)
             money_matches = re.findall(money_regex, window_text)
             if len(money_matches) >= 2:
                 chosen = money_matches[1]
@@ -193,11 +214,15 @@ def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str, req
                 chosen = money_matches[0]
                 normalized = _normalize_money_str(chosen)
                 return normalized or ""
+
+            # 4) procurar no resto da linha apenas (último valor)
             money_matches_full = re.findall(money_regex, line)
             if money_matches_full:
                 chosen = money_matches_full[-1]
                 normalized = _normalize_money_str(chosen)
                 return normalized or ""
+
+            # 5) verificar próximas linhas individualmente (último valor)
             for j in range(1, 4):
                 if idx + j < len(lines):
                     nxt = lines[idx + j]
@@ -208,30 +233,7 @@ def _extract_value_from_line_block(bloco: str, code: str, desc_pattern: str, req
                         if normalized:
                             return normalized
             return ""
-    # fallback: procurar apenas pela descrição em qualquer linha (se require_code == False)
-    if not require_code:
-        for idx, line in enumerate(lines):
-            if re.search(desc_pattern, line, flags=re.IGNORECASE):
-                window_text = ' '.join(lines[idx: idx + 3])
-                money_matches = re.findall(money_regex, window_text)
-                if len(money_matches) >= 2:
-                    chosen = money_matches[1]
-                    normalized = _normalize_money_str(chosen)
-                    return normalized or ""
-                if len(money_matches) == 1:
-                    chosen = money_matches[0]
-                    normalized = _normalize_money_str(chosen)
-                    return normalized or ""
-                for j in range(1, 4):
-                    if idx + j < len(lines):
-                        nxt = lines[idx + j]
-                        money_matches_n = re.findall(money_regex, nxt)
-                        if money_matches_n:
-                            chosen = money_matches_n[-1]
-                            normalized = _normalize_money_str(chosen)
-                            if normalized:
-                                return normalized
-                return ""
+    # fallback geral: nada encontrado
     return ""
 
 
