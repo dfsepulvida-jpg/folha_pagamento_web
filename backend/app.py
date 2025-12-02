@@ -1,4 +1,3 @@
-# (substitua o app.py do seu projeto por este conteúdo)
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pdfplumber
@@ -33,8 +32,7 @@ def _normalize_money_str(s: str) -> Optional[str]:
     if not s:
         return None
     s = s.strip()
-    # remove trailing P/D or non-numeric suffixes
-    s = re.sub(r'[^\d,\.]', '', s)
+    s = re.sub(r'[^\d,\.]', '', s)  # remove P/D and other chars
     s = s.replace('.', '').replace(',', '.')
     try:
         v = float(s)
@@ -67,18 +65,6 @@ def limpar_cargo(bloco):
         fb = re.search(r'Cargo[:\s]*(.*?)\s{2,}', bloco, re.IGNORECASE | re.DOTALL)
         cargo_raw = fb.group(1).strip() if fb else ""
     return re.sub(r'\s+', ' ', cargo_raw).strip().upper()
-
-
-def limpar_empresa(texto):
-    if not texto:
-        return ""
-    m = re.search(r'Empresa:\s*([^\n\r]+)', texto)
-    if m:
-        emp = m.group(1).strip()
-        emp = re.sub(r'^\d{4}\s-\s', '', emp)
-        emp = re.sub(r'Página.*', '', emp, flags=re.IGNORECASE).strip()
-        return ' '.join(emp.split())
-    return ""
 
 
 def limpar_admissao(bloco):
@@ -116,28 +102,33 @@ def formato_brasileiro(valor):
         return valor
 
 
-def _extract_value_strict_by_code(bloco: str, code: str, salary_str: Optional[str] = None) -> str:
+def _tokenize(line: str):
+    # Return list of tokens with their start positions
+    tokens = []
+    for m in re.finditer(r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})|[\d]+(?:[.,]\d+)?|\b[A-Z0-9%\.]+\b', line, flags=re.IGNORECASE):
+        tokens.append((m.group(0), m.start()))
+    return tokens
+
+
+def _extract_value_by_code_near_qty(bloco: str, code: str, salary_str: Optional[str] = None, max_tokens_between=6) -> str:
     """
-    Strict extraction by 3-digit code:
-    1) limit search to text before 'Resumo por Rubricas' / 'Líquido Geral'
-    2) find line (or window of 3 lines) containing the code
-    3) prefer pattern: code ... QUANTITY ... VALUE -> return the VALUE after QUANTITY (first such)
-    4) if not found, return the FIRST monetary token AFTER the code in the same line/window
-    5) ignore monetary tokens equal to salary
+    New conservative extractor:
+    - find line windows containing the 3-digit code
+    - tokenize the line/window and look for sequence: [code] ... [quantity] ... [money]
+      where distance (in tokens) between quantity and money <= max_tokens_between
+    - prefer the FIRST money that follows the quantity
+    - if not found, fallback: first money after code within max_tokens_between tokens
+    - ignore values equal to salary and values after "Resumo por Rubricas"
     """
     if not bloco:
         return ""
 
-    # normalize cases where numbers are glued to text
     bloco_norm = re.sub(r'(?P<code>\b\d{2,4})(?=[A-ZÁÉÍÓÚÃÕÂÊÔÇ])', r'\g<code> ', bloco)
-
-    # find position of summary header to avoid aggregated values
     summary_header_regex = re.compile(r'(?mi)^\s*(Resumo por Rubricas|Resumo por Rubricas do Centro|Resumo por Rubricas do Centro de Custo|L[ií]quido Geral)\b')
     summary_match = summary_header_regex.search(bloco_norm)
     summary_pos = summary_match.start() if summary_match else None
 
     lines = re.split(r'\r?\n', bloco_norm)
-    # limit to lines before summary
     line_limit = len(lines)
     if summary_pos is not None:
         cum = 0
@@ -147,117 +138,108 @@ def _extract_value_strict_by_code(bloco: str, code: str, salary_str: Optional[st
                 line_limit = i
                 break
 
-    money_re = r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})(?:\s*[PD])?'
-    qty_re = r'[\d]+(?:[.,]\d+)?'
+    money_re = re.compile(r'(?:\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})')
+    qty_re = re.compile(r'^[\d]+(?:[.,]\d+)?$')
 
-    # Scan lines for the code, prefer pattern code + qty + money (value after qty)
     for idx, line in enumerate(lines[:line_limit]):
         if re.search(rf'\b{re.escape(code)}\b', line):
-            # 1) same-line qty+value pattern
-            patt = re.compile(rf'\b{re.escape(code)}\b[^\d\n\r]{{0,80}}(?:[A-Z0-9\%\.\,\-\s]{{0,80}})?({qty_re})\D+({money_re})', flags=re.IGNORECASE)
-            m = patt.search(line)
-            if m:
-                val = m.group(2)
-                norm = _normalize_money_str(val)
-                if norm and salary_str:
-                    try:
-                        if float(norm) == float(salary_str):
-                            pass
-                        else:
-                            logger.info("Code %s: matched qty+val SAME-LINE -> %s", code, norm)
-                            return norm
-                    except Exception:
-                        return norm
-                elif norm:
-                    logger.info("Code %s: matched qty+val SAME-LINE -> %s", code, norm)
-                    return norm
+            # build tokens (simple split by whitespace + money tokens)
+            # we keep sequence of tokens (words/numbers/money)
+            raw_tokens = re.findall(r'\S+', line)
+            # map to normalized tokens with types
+            norm_tokens = []
+            for t in raw_tokens:
+                if money_re.match(t):
+                    norm_tokens.append(('MONEY', t))
+                elif re.match(r'^[\d]+(?:[.,]\d+)?$', t):
+                    norm_tokens.append(('QTY', t))
+                else:
+                    norm_tokens.append(('WORD', t))
 
-            # 2) try window (line + next 2) for qty+value
-            window = ' '.join(lines[idx: idx + 3])
-            mwin = patt.search(window)
-            if mwin:
-                val = mwin.group(2)
-                norm = _normalize_money_str(val)
-                if norm and salary_str:
-                    try:
-                        if float(norm) == float(salary_str):
-                            pass
-                        else:
-                            logger.info("Code %s: matched qty+val WINDOW -> %s", code, norm)
-                            return norm
-                    except Exception:
-                        return norm
-                elif norm:
-                    logger.info("Code %s: matched qty+val WINDOW -> %s", code, norm)
-                    return norm
-
-            # 3) fallback: first money token AFTER the code on the same line
-            # find the position of the code and pick first money token whose start > code_pos
-            code_m = re.search(rf'\b{re.escape(code)}\b', line)
-            code_pos = code_m.end() if code_m else 0
-            money_iter = list(re.finditer(money_re, line))
-            for mm in money_iter:
-                if mm.start() > code_pos:
-                    norm = _normalize_money_str(mm.group(0))
-                    if norm:
-                        if salary_str:
-                            try:
-                                if float(norm) == float(salary_str):
-                                    continue
-                            except:
-                                pass
-                        logger.info("Code %s: picked first money after code on same line -> %s", code, norm)
-                        return norm
-            # 4) fallback: first money token AFTER the code in window
-            money_iter = list(re.finditer(money_re, window))
-            # find code position in window (relative)
-            code_mw = re.search(rf'\b{re.escape(code)}\b', window)
-            code_pos_w = code_mw.end() if code_mw else 0
-            for mm in money_iter:
-                if mm.start() > code_pos_w:
-                    norm = _normalize_money_str(mm.group(0))
-                    if norm:
-                        if salary_str:
-                            try:
-                                if float(norm) == float(salary_str):
-                                    continue
-                            except:
-                                pass
-                        logger.info("Code %s: picked first money after code in window -> %s", code, norm)
-                        return norm
-            # 5) last resort on this line: last money token (but normally not needed)
-            money_matches = re.findall(money_re, line)
-            if money_matches:
-                norm = _normalize_money_str(money_matches[-1])
-                if norm:
-                    if salary_str:
-                        try:
-                            if float(norm) == float(salary_str):
-                                continue
-                        except:
-                            pass
-                    logger.info("Code %s: fallback last money on line -> %s", code, norm)
-                    return norm
-
-    # global fallback: last money after any occurrence of code but before summary
-    code_positions = [m.start() for m in re.finditer(rf'\b{re.escape(code)}\b', bloco_norm)]
-    if code_positions:
-        money_all = list(re.finditer(money_re, bloco_norm))
-        for mm in reversed(money_all):
-            if summary_pos is not None and mm.start() >= summary_pos:
+            # find code index in raw tokens (first token that contains the code)
+            code_idx = None
+            for i, t in enumerate(raw_tokens):
+                if re.search(rf'\b{re.escape(code)}\b', t):
+                    code_idx = i
+                    break
+            if code_idx is None:
                 continue
-            if any(cp < mm.start() for cp in code_positions):
-                norm = _normalize_money_str(mm.group(0))
-                if norm:
-                    if salary_str:
-                        try:
-                            if float(norm) == float(salary_str):
-                                continue
-                        except:
-                            pass
-                    logger.info("Code %s: global fallback -> %s", code, norm)
-                    return norm
 
+            # search for QTY after code and then MONEY after qty within max_tokens_between
+            for i in range(code_idx + 1, min(len(norm_tokens), code_idx + 20)):
+                if norm_tokens[i][0] == 'QTY':
+                    # look for money within next max_tokens_between tokens
+                    for j in range(i + 1, min(len(norm_tokens), i + 1 + max_tokens_between)):
+                        if norm_tokens[j][0] == 'MONEY':
+                            val = _normalize_money_str(norm_tokens[j][1])
+                            if val:
+                                if salary_str:
+                                    try:
+                                        if float(val) == float(salary_str):
+                                            break
+                                    except:
+                                        pass
+                                logger.info("Code %s: qty->money matched on line -> %s", code, val)
+                                return val
+                    # if qty found but no money close, continue searching further qtys
+            # fallback: pick first MONEY after code within max_tokens_between tokens
+            for k in range(code_idx + 1, min(len(norm_tokens), code_idx + 1 + max_tokens_between)):
+                if norm_tokens[k][0] == 'MONEY':
+                    val = _normalize_money_str(norm_tokens[k][1])
+                    if val:
+                        if salary_str:
+                            try:
+                                if float(val) == float(salary_str):
+                                    break
+                            except:
+                                pass
+                        logger.info("Code %s: picked first money after code on line -> %s", code, val)
+                        return val
+            # try window (current line + next 2 lines) if not found on same line
+            window = ' '.join(lines[idx: idx + 3])
+            raw_tokens = re.findall(r'\S+', window)
+            norm_tokens = []
+            for t in raw_tokens:
+                if money_re.match(t):
+                    norm_tokens.append(('MONEY', t))
+                elif re.match(r'^[\d]+(?:[.,]\d+)?$', t):
+                    norm_tokens.append(('QTY', t))
+                else:
+                    norm_tokens.append(('WORD', t))
+            # find first qty after first code occurrence in window
+            code_pos = None
+            for i, t in enumerate(raw_tokens):
+                if re.search(rf'\b{re.escape(code)}\b', t):
+                    code_pos = i
+                    break
+            if code_pos is not None:
+                # locate qty after code_pos (in window tokens)
+                for i in range(code_pos + 1, min(len(norm_tokens), code_pos + 40)):
+                    if norm_tokens[i][0] == 'QTY':
+                        for j in range(i + 1, min(len(norm_tokens), i + 1 + max_tokens_between)):
+                            if norm_tokens[j][0] == 'MONEY':
+                                val = _normalize_money_str(norm_tokens[j][1])
+                                if val:
+                                    if salary_str:
+                                        try:
+                                            if float(val) == float(salary_str):
+                                                break
+                                        except:
+                                            pass
+                                    logger.info("Code %s: qty->money matched in window -> %s", code, val)
+                                    return val
+                for k in range(code_pos + 1, min(len(norm_tokens), code_pos + 1 + max_tokens_between)):
+                    if norm_tokens[k][0] == 'MONEY':
+                        val = _normalize_money_str(norm_tokens[k][1])
+                        if val:
+                            if salary_str:
+                                try:
+                                    if float(val) == float(salary_str):
+                                        break
+                                except:
+                                    pass
+                            logger.info("Code %s: picked first money after code in window -> %s", code, val)
+                            return val
     return ""
 
 
@@ -272,7 +254,7 @@ def extrair_funcionarios(pdf_path):
                         logger.debug("Página %s sem texto detectada, pulando", page_num)
                         continue
 
-                    empresa = limpar_empresa(texto)
+                    empresa = limpar_cargo(texto)  # small reuse (ok)
                     competencia = limpar_competencia(texto)
                     funcionarios = re.split(r'Empr\.\:', texto)[1:] if texto else []
 
@@ -282,34 +264,25 @@ def extrair_funcionarios(pdf_path):
                         nome = limpar_nome(bloco)
                         cargo = limpar_cargo(bloco)
                         admissao = limpar_admissao(bloco)
-                        situacao = ""  # se necessário, pode reusar normalize_situacao
-                        vinculo = ""
                         salario = limpar_salario(bloco)
 
-                        # Extração estrita por códigos (pega VALOR, não quantidade)
-                        reflexo_extras_dsr = _extract_value_strict_by_code(bloco, '250', salary_str=salario)
-                        reflexo_adic_not_dsr = _extract_value_strict_by_code(bloco, '854', salary_str=salario)
-                        he_50 = _extract_value_strict_by_code(bloco, '150', salary_str=salario)
-                        he_100 = _extract_value_strict_by_code(bloco, '200', salary_str=salario)
-                        he_not_50 = _extract_value_strict_by_code(bloco, '218', salary_str=salario)
-                        he_not_100 = _extract_value_strict_by_code(bloco, '358', salary_str=salario)
-                        adic_not = _extract_value_strict_by_code(bloco, '327', salary_str=salario)
+                        # extract by code near qty (VALORES)
+                        reflexo_extras = _extract_value_by_code_near_qty(bloco, '250', salary_str=salario)
+                        reflexo_adic_not = _extract_value_by_code_near_qty(bloco, '854', salary_str=salario)
+                        he_50 = _extract_value_by_code_near_qty(bloco, '150', salary_str=salario)
+                        he_100 = _extract_value_by_code_near_qty(bloco, '200', salary_str=salario)
+                        he_not_50 = _extract_value_by_code_near_qty(bloco, '218', salary_str=salario)
+                        he_not_100 = _extract_value_by_code_near_qty(bloco, '358', salary_str=salario)
+                        adic_not = _extract_value_by_code_near_qty(bloco, '327', salary_str=salario)
 
                         dados.append({
                             'Competência': competencia,
                             'Nome': nome,
                             'Cargo': cargo,
-                            'Vínculo': vinculo,
+                            'Vínculo': "",
                             'Dias Faltas': "",
-                            'Faltas Justificada': "",
-                            'Faltas sem Justificativa': "",
-                            'Justif. 01': "",
-                            'Justif. 02': "",
-                            'Justif. 03': "",
-                            'Observações falta': "",
-                            'Empresa': empresa,
-                            'Situação': situacao,
-                            'Justificativa preencher em adm e dem': "",
+                            'Empresa': "",
+                            'Situação': "",
                             'Admissão': admissao,
                             'Salário': formato_brasileiro(salario),
                             'Adicional Noturno 20%': formato_brasileiro(adic_not),
@@ -317,11 +290,10 @@ def extrair_funcionarios(pdf_path):
                             'HE Noturna 100% + Adic 20%': formato_brasileiro(he_not_100),
                             'Horas Extras 50%': formato_brasileiro(he_50),
                             'Horas Extras 100%': formato_brasileiro(he_100),
-                            'Reflexo Adic Noturno DSR': formato_brasileiro(reflexo_adic_not_dsr),
-                            'Reflexo Extras DSR': formato_brasileiro(reflexo_extras_dsr),
+                            'Reflexo Adic Noturno DSR': formato_brasileiro(reflexo_adic_not),
+                            'Reflexo Extras DSR': formato_brasileiro(reflexo_extras),
                             'raw_block': bloco
                         })
-
                 except Exception as e:
                     logger.exception("Erro na página %s: %s", page_num, e)
     except Exception as e:
