@@ -32,13 +32,56 @@ def _normalize_money_str(s: str) -> Optional[str]:
     if not s:
         return None
     s = s.strip()
-    s = re.sub(r'[^\d,\.]', '', s)  # remove P/D and other chars
+    s = re.sub(r'[^\d,\.]', '', s)
     s = s.replace('.', '').replace(',', '.')
     try:
         v = float(s)
         return f"{v:.2f}"
     except Exception:
         return None
+
+
+def formato_brasileiro(valor: Optional[str]) -> str:
+    try:
+        if valor is None or valor == "":
+            return ""
+        f = float(valor)
+        return f"{f:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    except:
+        return valor or ""
+
+
+# ---------- campo básicos/metadata ----------
+def limpar_empresa(texto: str) -> str:
+    if not texto:
+        return ""
+    m = re.search(r'Empresa:\s*([^\n\r]+)', texto)
+    if m:
+        emp = m.group(1).strip()
+        emp = re.sub(r'^\d{4}\s-\s', '', emp)
+        emp = re.sub(r'Página.*', '', emp, flags=re.IGNORECASE).strip()
+        return ' '.join(emp.split())
+    return ""
+
+
+def limpar_competencia(texto: str) -> str:
+    m = re.search(r'Competência:\s*(\d{2}/\d{4})', texto)
+    if m:
+        mes, ano = m.group(1).split('/')
+        return f"01/{mes}/{ano}"
+    return ""
+
+
+def limpar_salario(bloco: str) -> str:
+    patterns = [r'(?:Sal[aáàâãä]rio|SALARIO|SALÁRIO)\s*[:\-]?\s*([\d\.,]+)', r'\bSal\b[:\s]*([\d\.,]+)']
+    for p in patterns:
+        m = re.search(p, bloco, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).replace('.', '').replace(',', '.')
+    m2 = re.search(r'8781\s*DIAS\s*NORMAIS.*?([\d\.,]+)', bloco, flags=re.IGNORECASE | re.DOTALL)
+    if m2:
+        return m2.group(1).replace('.', '').replace(',', '.')
+    return ""
 
 
 def limpar_nome(bloco: str) -> str:
@@ -72,61 +115,57 @@ def limpar_admissao(bloco: str) -> str:
     return m.group(1) if m else ""
 
 
-def limpar_competencia(texto: str) -> str:
-    m = re.search(r'Competência:\s*(\d{2}/\d{4})', texto)
+def limpar_situacao_raw(bloco: str) -> str:
+    m = re.search(r'Situa(?:ç|c)[aã]o\:?[\s]*([^\n\r]+)', bloco, flags=re.IGNORECASE)
     if m:
-        mes, ano = m.group(1).split('/')
-        return f"01/{mes}/{ano}"
+        s = m.group(1).strip().split('CPF')[0].strip()
+        return ' '.join(s.split())
     return ""
 
 
-def limpar_salario(bloco: str) -> str:
-    patterns = [r'(?:Sal[aáàâãä]rio|SALARIO|SALÁRIO)\s*[:\-]?\s*([\d\.,]+)', r'\bSal\b[:\s]*([\d\.,]+)']
-    for p in patterns:
-        m = re.search(p, bloco, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).replace('.', '').replace(',', '.')
-    m2 = re.search(r'8781\s*DIAS\s*NORMAIS.*?([\d\.,]+)', bloco, flags=re.IGNORECASE | re.DOTALL)
-    if m2:
-        return m2.group(1).replace('.', '').replace(',', '.')
-    return ""
+def normalize_situacao(situacao_raw: str, admissao_str: str, competencia_str: str) -> str:
+    admissao_date = _parse_date_ddmmyyyy(admissao_str) if admissao_str else None
+    competencia_date = _parse_date_ddmmyyyy(competencia_str) if competencia_str else None
+    if admissao_date and competencia_date:
+        if admissao_date.year == competencia_date.year and admissao_date.month == competencia_date.month:
+            return "Admissão"
+    s = (situacao_raw or "").strip().lower()
+    if "demit" in s or "deslig" in s or "rescind" in s:
+        return "Demissão"
+    if "trabalh" in s or "ativo" in s or "empreg" in s or "contrat" in s:
+        return "Ativo"
+    return (situacao_raw or "").strip().title()
 
 
-def formato_brasileiro(valor: Optional[str]) -> str:
-    try:
-        if valor is None or valor == "":
-            return ""
-        f = float(valor)
-        return f"{f:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
-    except:
-        return valor or ""
+def limpar_vinculo(bloco: str) -> str:
+    m = re.search(r'V[ií]nculo:\s*([^\n\r]+)', bloco, re.IGNORECASE)
+    if not m:
+        return ""
+    raw = m.group(1).strip()
+    raw = re.sub(r'\s+', ' ', raw)
+    first = re.match(r'([A-Za-zÇçÁáÉéÍíÓóÚúÃãÕõÂâÊêÔô\-]+)', raw)
+    if first and first.group(1).lower() == 'celetista':
+        return 'CLT'
+    return first.group(1) if first else raw
 
 
+def extrair_campo_quantidade_flex(bloco: str, codigo: str, texto: str) -> str:
+    pattern = rf"{re.escape(str(codigo))}\s*{texto}.*?([\d]+[.,]\d+|[\d]+)"
+    m = re.search(pattern, bloco, re.IGNORECASE | re.DOTALL)
+    return m.group(1).replace(',', '.') if m else ""
+
+
+# ---------- extractor P-based (estrito) ----------
 def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[str] = None) -> str:
-    """
-    Improved extractor:
-    - require presence of the 3-digit code in the block
-    - prefer money tokens followed by 'P' that appear AFTER the code (same line or short window)
-    - fallback (conservative): if no money+P found, try qty -> money (no P) on same line/window,
-      still refusing global scans that pick unrelated values.
-    - if nothing reliable is found, return empty string (safer than incorrect data).
-    """
     if not bloco:
         return ""
-
-    # must have the code present
     if not re.search(rf'\b{re.escape(code)}\b', bloco):
         logger.debug("Code %s not present in block -> empty", code)
         return ""
-
-    # normalize glued tokens like "150HORAS" -> "150 HORAS"
     bloco_norm = re.sub(r'(?P<code>\b\d{2,4})(?=[A-ZÁÉÍÓÚÃÕÂÊÔÇ])', r'\g<code> ', bloco)
-
-    # limit search before summary header
     summary_header_regex = re.compile(r'(?mi)^\s*(Resumo por Rubricas|Resumo por Rubricas do Centro|Resumo por Rubricas do Centro de Custo|L[ií]quido Geral)\b')
     summary_match = summary_header_regex.search(bloco_norm)
     summary_pos = summary_match.start() if summary_match else None
-
     lines = re.split(r'\r?\n', bloco_norm)
     line_limit = len(lines)
     if summary_pos is not None:
@@ -136,17 +175,12 @@ def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[s
             if cum >= summary_pos:
                 line_limit = i
                 break
-
     money_p_re = re.compile(r'(\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})\s*P\b', flags=re.IGNORECASE)
     money_re = re.compile(r'(\d{1,3}(?:\.\d{3})*|\d+),(?:\d{2})')
     qty_re = re.compile(r'^[\d]+(?:[.,]\d+)?$')
-
-    # Iterate over lines that contain the code
     for idx, line in enumerate(lines[:line_limit]):
         if re.search(rf'\b{re.escape(code)}\b', line):
             code_pos = re.search(rf'\b{re.escape(code)}\b', line).end()
-
-            # 1) Prefer money+P on same line after code
             for m in money_p_re.finditer(line):
                 if m.start() >= code_pos:
                     val_raw = m.group(0)
@@ -160,8 +194,6 @@ def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[s
                     if norm:
                         logger.info("Code %s: matched money+P on same line -> %s", code, norm)
                         return norm
-
-            # 2) money+P in window (line + next 2 lines)
             window = ' '.join(lines[idx: idx + 3])
             code_pos_w_match = re.search(rf'\b{re.escape(code)}\b', window)
             code_pos_w = code_pos_w_match.end() if code_pos_w_match else 0
@@ -178,10 +210,7 @@ def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[s
                     if norm:
                         logger.info("Code %s: matched money+P in window -> %s", code, norm)
                         return norm
-
-            # 3) FALLBACK (conservative): try pattern qty -> money (no P) on same line
-            #    Example: "150 HORAS EXTRAS 50% 19,01 417,40" -> pick 417,40
-            #    We search for a numeric token (quantity) followed shortly by a money token
+            # fallback: qty -> money on same line
             raw_tokens = re.findall(r'\S+', line)
             norm_tokens = []
             for t in raw_tokens:
@@ -191,8 +220,6 @@ def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[s
                     norm_tokens.append(('QTY', t))
                 else:
                     norm_tokens.append(('WORD', t))
-            # find first QTY after code position (approx by matching tokens)
-            # determine token index that contains the code
             code_token_idx = None
             for i, t in enumerate(raw_tokens):
                 if re.search(rf'\b{re.escape(code)}\b', t):
@@ -201,7 +228,6 @@ def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[s
             if code_token_idx is not None:
                 for i in range(code_token_idx + 1, min(len(norm_tokens), code_token_idx + 20)):
                     if norm_tokens[i][0] == 'QTY':
-                        # look for MONEY within next up-to-6 tokens
                         for j in range(i + 1, min(len(norm_tokens), i + 1 + 6)):
                             if norm_tokens[j][0] == 'MONEY':
                                 val_raw = norm_tokens[j][1]
@@ -215,8 +241,7 @@ def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[s
                                 if norm:
                                     logger.info("Code %s: fallback qty->money on line -> %s", code, norm)
                                     return norm
-
-            # 4) fallback in window: same qty->money scan on window tokens
+            # fallback on window tokens
             window_tokens = re.findall(r'\S+', window)
             norm_tokens = []
             for t in window_tokens:
@@ -247,11 +272,8 @@ def _extract_value_by_code_using_P(bloco: str, code: str, salary_str: Optional[s
                                 if norm:
                                     logger.info("Code %s: fallback qty->money in window -> %s", code, norm)
                                     return norm
-
-            # 5) If none found, do NOT perform global fallback (avoid wrong right-column values)
             logger.debug("Code %s present but no reliable value found -> empty", code)
             return ""
-
     return ""
 
 
@@ -265,20 +287,19 @@ def extrair_funcionarios(pdf_path: str):
                     if not texto:
                         logger.debug("Página %s sem texto detectada, pulando", page_num)
                         continue
-
-                    empresa = ""  # optional
+                    empresa = limpar_empresa(texto)
                     competencia = limpar_competencia(texto)
                     funcionarios = re.split(r'Empr\.\:', texto)[1:] if texto else []
-
                     for func_raw in funcionarios:
                         bloco = "Empr.:" + func_raw
-
                         nome = limpar_nome(bloco)
                         cargo = limpar_cargo(bloco)
                         admissao = limpar_admissao(bloco)
+                        situacao_raw = limpar_situacao_raw(bloco)
+                        situacao = normalize_situacao(situacao_raw, admissao, competencia)
+                        vinculo = limpar_vinculo(bloco)
                         salario = limpar_salario(bloco)
-
-                        # strict P-based extraction, with conservative fallback for qty->money
+                        dias_faltas = extrair_campo_quantidade_flex(bloco, '8792', r'DIAS\s*FALTAS')
                         reflexo_extras = _extract_value_by_code_using_P(bloco, '250', salary_str=salario)
                         reflexo_adic_not = _extract_value_by_code_using_P(bloco, '854', salary_str=salario)
                         he_50 = _extract_value_by_code_using_P(bloco, '150', salary_str=salario)
@@ -286,15 +307,21 @@ def extrair_funcionarios(pdf_path: str):
                         he_not_50 = _extract_value_by_code_using_P(bloco, '218', salary_str=salario)
                         he_not_100 = _extract_value_by_code_using_P(bloco, '358', salary_str=salario)
                         adic_not = _extract_value_by_code_using_P(bloco, '327', salary_str=salario)
-
                         dados.append({
                             'Competência': competencia,
                             'Nome': nome,
                             'Cargo': cargo,
-                            'Vínculo': "",
-                            'Dias Faltas': "",
+                            'Vínculo': vinculo,
+                            'Dias Faltas': dias_faltas,
+                            'Faltas Justificada': "",
+                            'Faltas sem Justificativa': "",
+                            'Justif. 01': "",
+                            'Justif. 02': "",
+                            'Justif. 03': "",
+                            'Observações falta': "",
                             'Empresa': empresa,
-                            'Situação': "",
+                            'Situação': situacao,
+                            'Justificativa preencher em adm e dem': "",
                             'Admissão': admissao,
                             'Salário': formato_brasileiro(salario),
                             'Adicional Noturno 20%': formato_brasileiro(adic_not),
@@ -306,7 +333,6 @@ def extrair_funcionarios(pdf_path: str):
                             'Reflexo Extras DSR': formato_brasileiro(reflexo_extras),
                             'raw_block': bloco
                         })
-
                 except Exception as e_page:
                     logger.exception("Erro ao processar página %s: %s", page_num, e_page)
     except Exception as e:
@@ -318,12 +344,10 @@ def extrair_funcionarios(pdf_path: str):
 def upload():
     if 'file' not in request.files:
         return jsonify({"error": "Nenhum arquivo enviado com a chave 'file'."}), 400
-
     file = request.files['file']
     filename = secure_filename(file.filename or "upload.pdf")
     if not filename.lower().endswith('.pdf'):
         return jsonify({"error": "Apenas arquivos PDF são aceitos."}), 400
-
     tmp_file = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as f:
